@@ -1,7 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-# Python version: 3.6
-
 import copy
 import torch
 import numpy as np
@@ -26,8 +22,14 @@ def aggregate_weights(args, w_locals, net_glob, reweights, fg, reputation_effect
     if args.agg == 'median':
         print("using simple median Estimator")
         w_glob = simple_median(w_locals)
+    elif args.agg == 'trimmed_mean':
+        print("using trimmed mean Estimator")
+        w_glob = trimmed_mean(w_locals, args.alpha)
+    elif args.agg == 'repeated':
+        print("using repeated median Estimator")
+        w_glob = Repeated_Median_Shard(w_locals)
     elif args.agg == 'irls':
-        print("using IRLS Estimator with reputation")
+        print("using IRLS Estimator")
         w_glob, reweight = IRLS_aggregation_split_restricted(w_locals, args.reputation_active, args.Lambda, args.thresh, reputation_effect,args.kappa, args.W, args.z, args.s)
         print(reweight)
         reweights.append(reweight)
@@ -36,6 +38,37 @@ def aggregate_weights(args, w_locals, net_glob, reweights, fg, reputation_effect
         w_glob, reweight = simple_IRLS(w_locals, args.Lambda, args.thresh, args.alpha)
         print(reweight)
         reweights.append(reweight)
+    elif args.agg == 'irls_median':
+        print("using median IRLS Estimator")
+        w_glob, reweight = IRLS_other_split_restricted(w_locals, args.Lambda, args.thresh, mode='median')
+        print(reweight)
+        reweights.append(reweight)
+    elif args.agg == 'irls_theilsen':
+        print("using TheilSen IRLS Estimator")
+        w_glob, reweight = IRLS_other_split_restricted(w_locals, args.Lambda, args.thresh, mode='theilsen')
+        print(reweight)
+        reweights.append(reweight)
+    elif args.agg == 'irls_gaussian':
+        print("using Gaussian IRLS Estimator")
+        w_glob, reweight = IRLS_other_split_restricted(w_locals, args.Lambda, args.thresh, mode='gaussian')
+        print(reweight)
+        reweights.append(reweight)
+    elif args.agg == 'fltrust':
+        w_glob = fltrust(w_locals)
+    elif args.agg == 'fg':
+        # Update model
+        # Add all the gradients to the model gradient
+        net_glob.train()
+        # train and update
+        optimizer = torch.optim.SGD(net_glob.parameters(), lr=args.lr, momentum=args.momentum)
+        optimizer.zero_grad()
+        agg_grads = fg.aggregate_gradients(w_locals)
+        for i, (name, params) in enumerate(net_glob.named_parameters()):
+            if params.requires_grad:
+                params.grad = agg_grads[i].cuda()
+        optimizer.step()
+        # w_glob = params.grad
+        w_glob = agg_grads
     elif args.agg == 'average':
         print("using average")
         w_glob = average_weights(w_locals)
@@ -119,6 +152,31 @@ def reweight_algorithm_restricted(y, LAMBDA, thresh):
     return reweight_regulized, restricted_y, opinion_matrix
 
 
+def gaussian_reweight_algorithm_restricted(y, sig, thresh):
+    num_models = y.shape[1]
+    total_num = y.shape[0]
+    slopes, intercepts = repeated_median(y)
+    X_pure = y.sort()[1].sort()[1].type(torch.float)
+    X_pure = X_pure.unsqueeze(2)
+    X = torch.cat((torch.ones(total_num, num_models, 1).to(y.device), X_pure), dim=-1)
+
+    beta = torch.cat((intercepts.repeat(num_models, 1).transpose(0, 1).unsqueeze(2),
+                      slopes.repeat(num_models, 1).transpose(0, 1).unsqueeze(2)), dim=-1)
+    line_y = (beta * X).sum(dim=-1)
+    residual = y - line_y
+    M = median_opt(residual.abs().sort()[0][..., 1:])
+    tau = 1.4826 * (1 + 5 / (num_models - 1)) * M + 1e-7
+    e = residual / tau.repeat(num_models, 1).transpose(0, 1)
+
+    reweight = gaussian_zero_mean(e, sig=sig)
+    reweight_std = reweight.std(dim=1)  # its standard deviation
+    reshaped_std = torch.t(reweight_std.repeat(num_models, 1))
+    reweight_regulized = reweight * reshaped_std  # reweight confidence by its standard deviation
+    restricted_y = y * (reweight >= thresh).type(torch.cuda.FloatTensor) + line_y * (reweight < thresh).type(
+        torch.cuda.FloatTensor)
+    return reweight_regulized, restricted_y
+
+
 def theilsen_reweight_algorithm_restricted(y, LAMBDA, thresh):
     num_models = y.shape[1]
     total_num = y.shape[0]
@@ -149,6 +207,37 @@ def theilsen_reweight_algorithm_restricted(y, LAMBDA, thresh):
     reweight_regulized = reweight * reshaped_std  # reweight confidence by its standard deviation
 
     restricted_y = y * (reweight >= thresh).type(torch.cuda.FloatTensor) + line_y * (reweight < thresh).type(
+        torch.cuda.FloatTensor)
+    return reweight_regulized, restricted_y
+
+
+def median_reweight_algorithm_restricted(y, LAMBDA, thresh):
+    num_models = y.shape[1]
+    total_num = y.shape[0]
+    X_pure = y.sort()[1].sort()[1].type(torch.float)
+
+    # calculate H matrix
+    X_pure = X_pure.unsqueeze(2)
+    X = torch.cat((torch.ones(total_num, num_models, 1).to(y.device), X_pure), dim=-1)
+    X_X = torch.matmul(X.transpose(1, 2), X)
+    X_X = torch.matmul(X, torch.inverse(X_X))
+    H = torch.matmul(X_X, X.transpose(1, 2))
+    diag = torch.eye(num_models).repeat(total_num, 1, 1).to(y.device)
+    processed_H = (torch.sqrt(1 - H) * diag).sort()[0][..., -1]
+    K = torch.FloatTensor([LAMBDA * np.sqrt(2. / num_models)]).to(y.device)
+
+    y_median = median_opt(y).unsqueeze(1).repeat(1, num_models)
+    residual = y - y_median
+    M = median_opt(residual.abs().sort()[0][..., 1:])
+    tau = 1.4826 * (1 + 5 / (num_models - 1)) * M + 1e-7
+    e = residual / tau.repeat(num_models, 1).transpose(0, 1)
+    reweight = processed_H / e * torch.max(-K, torch.min(K, e / processed_H))
+    reweight[reweight != reweight] = 1
+    reweight_std = reweight.std(dim=1)  # its standard deviation
+    reshaped_std = torch.t(reweight_std.repeat(num_models, 1))
+    reweight_regulized = reweight * reshaped_std  # reweight confidence by its standard deviation
+
+    restricted_y = y * (reweight >= thresh).type(torch.cuda.FloatTensor) + y_median * (reweight < thresh).type(
         torch.cuda.FloatTensor)
     return reweight_regulized, restricted_y
 
@@ -216,7 +305,16 @@ def get_valid_models(w_locals):
     return w, invalid_model_idx
 
 
-def reputation_model_reweighting(w, opinion_matrix, reputation_effect, thresh, kappa, W, a, z, s=10, omega=2): 
+def reputation_model_reweighting(w, opinion_matrix, reputation_effect, thresh, kappa, W, a, z, s=10, omega=2):
+    
+    #while (max(reweight_sum)-min(reweight_sum))/len(reweight_sum)> omega:
+        #max_value  = max(reweight_sum)
+        #max_index = reweight_sum.index(max_value)
+        #reweight_sum[max_index] = max_value - statistics.stdev(reweight_sum)
+        #min_value = min(reweight_sum)
+        #min_index = reweight_sum.index(min_value)
+        #reweight_sum[min_index] = min_value + statistics.stdev(reweight_sum)
+   
     weight = []
     opinion_matrix = opinion_matrix.cpu()
     for i in range(len(w)):
@@ -230,31 +328,23 @@ def reputation_model_reweighting(w, opinion_matrix, reputation_effect, thresh, k
         belief = (belief_count*kappa)/(belief_count*kappa + disbelief_count*(1-kappa)+W)
         uncertainty = W/(belief_count*kappa + disbelief_count*(1-kappa)+W)
         reputation_effect[i].append((belief + a * uncertainty))
+        # print('reputation_effect',reputation_effect[i])
        
         reputation_timestamp = 0
         theta = [0] * len(reputation_effect[i])
 
-        for j in range(min(10,len(reputation_effect[i]))):
+        # for j in range(len(reputation_effect[i])):
+        for j in range(min(s,len(reputation_effect[i]))):
             theta[j] = math.exp(-z*(j))
+            # theta[j] = pow(z, len(reputation_effect[i]) - j - 1)
             reputation_timestamp += theta[j] * reputation_effect[i][len(reputation_effect[i])-j-1]
         reputation_timestamp = reputation_timestamp / sum(theta)
+        # print('reputation_timestamp',reputation_timestamp)
         weight.append(reputation_timestamp)
     return weight
 
 
 def IRLS_aggregation_split_restricted(w_locals, reputation_active, LAMBDA, thresh, reputation_effect, kappa=0.3, W=2, a=0.5, z=0.5, s=10):
-    """
-        Function to aggregate IRLS over Reputation Model
-        :param w_locals:
-        :param LAMBDA:
-        :param thresh: is threshold to select to check if we use the update.
-        :param kappa: the objective function value to fill out in the model when we consider R and S.
-        :param W: weight of the reputation we assigned initially, W=2 assigned in paper by default.
-        :param a: a priori probability in the absence of committed belief mass. If we increase a, we scale up reputation
-        :param z: time decay. If we increase z we scale up our reputation model.
-        :param reputation_active: parameter to control reputation model on/off.
-        :return: weights median and weights (w_med, weights)
-        """
     SHARD_SIZE = 2000
     cur_time = time.time()
     w, invalid_model_idx = get_valid_models(w_locals)
@@ -288,6 +378,10 @@ def IRLS_aggregation_split_restricted(w_locals, reputation_active, LAMBDA, thres
                 reweight_sum += reweight.sum(dim=0)
                 y_result[i * SHARD_SIZE: (i + 1) * SHARD_SIZE, ...] = restricted_y
         
+        # reweight, restricted_y, opinion_matrix = reweight_algorithm_restricted(transposed_y_list, LAMBDA, thresh)
+        # reweight_sum += reweight.sum(dim=0)
+        # y_result = restricted_y
+        
         # put restricted y back to w
         y_result = torch.t(y_result)
         for i in range(len(w)):
@@ -301,8 +395,12 @@ def IRLS_aggregation_split_restricted(w_locals, reputation_active, LAMBDA, thres
         
     reweight_sum = reweight_sum / reweight_sum.max()
     reweight_sum = reweight_sum * reweight_sum
+    # print('reweight',type(reweight))
+    # Printing the reweight_sum before any reputation calculation
+    # print("reiweight weights " + str(reweight_sum))
 
-    # Reputation
+    # Reputation effects code start
+    print(str(reputation_active))
     if reputation_active:
         print("Reputation Active")
         reweight = reputation_model_reweighting(w, opinion_matrix_sum, reputation_effect, thresh, kappa, W, a, z, s)
@@ -310,15 +408,28 @@ def IRLS_aggregation_split_restricted(w_locals, reputation_active, LAMBDA, thres
         scaler = MinMaxScaler()
         normalized_weight = scaler.fit_transform(np.array(reweight).reshape(-1,1))
         for i in range(len(normalized_weight)):
-            if normalized_weight[i] < 0.1:
+            if normalized_weight[i] < 1/len(normalized_weight):
                 normalized_weight[i] = 0
         reweight = torch.tensor(normalized_weight.reshape(1,-1)[0])
         print('weight after normalized', reweight)
+        # ReLu
+        # reweight = torch.tensor(reweight)
+        # Printing the reweight_sum before after reputation calculation
+        # print("reputation score: " + str(reweight))
     else:
         print("Reputation Inactive")
         reweight = reweight_sum
     
     w_med, reweight = weighted_average(w, reweight)
+    
+    # reweight = (reweight / reweight.max()).to(torch.device("cuda:0"))
+    
+    # weights = torch.zeros(len(w_locals))
+    # i = 0
+    # for j in range(len(w_locals)):
+        # if j not in invalid_model_idx:
+            # weights[j] = reweight[i]
+            # i += 1
 
     print('model aggregation took {}s'.format(time.time() - cur_time))
     return w_med, reweight
@@ -424,13 +535,6 @@ def Repeated_Median_Shard(w):
 
 
 def simple_IRLS(w, LAMBDA=2, thresh=0.03, alpha=1 / 11.0):
-    """
-       :param w:
-       :param LAMBDA:
-       :param thresh:
-       :param alpha:
-       :return:
-       """
     SHARD_SIZE = 50000
     cur_time = time.time()
     w_med = copy.deepcopy(w[0])
@@ -568,8 +672,184 @@ def Repeated_Median(w):
     return w_med
 
 
+# Takes in grad
+# Compute similarity
+# Get weightings
+def foolsgold(grads):
+    n_clients = grads.shape[0]
+    cs = smp.cosine_similarity(grads) - np.eye(n_clients)
+    maxcs = np.max(cs, axis=1)
+    # pardoning
+    for i in range(n_clients):
+        for j in range(n_clients):
+            if i == j:
+                continue
+            if maxcs[i] < maxcs[j]:
+                cs[i][j] = cs[i][j] * maxcs[i] / maxcs[j]
+    wv = 1 - (np.max(cs, axis=1))
+    wv[wv > 1] = 1
+    wv[wv < 0] = 0
 
-if __name__ == "__main__": 
+    # Rescale so that max value is wv
+    wv = wv / np.max(wv)
+    wv[(wv == 1)] = .99
+
+    # Logit function
+    wv = (np.log(wv / (1 - wv)) + 0.5)
+    wv[(np.isinf(wv) + wv > 1)] = 1
+    wv[(wv < 0)] = 0
+
+    return wv
+
+class FoolsGold(object):
+    def __init__(self, args):
+        self.memory = None
+        self.wv_history = []
+        self.args = args
+
+    def aggregate_gradients(self, client_grads):
+        cur_time = time.time()
+        num_clients = len(client_grads)
+        grad_len = np.array(client_grads[0][-2].cpu().data.numpy().shape).prod()
+        if self.memory is None:
+            self.memory = np.zeros((num_clients, grad_len))
+
+        grads = np.zeros((num_clients, grad_len))
+        for i in range(len(client_grads)):
+            grads[i] = np.reshape(client_grads[i][-2].cpu().data.numpy(), (grad_len))
+        
+        self.memory = grads
+        
+        if self.args.use_memory:
+            wv = foolsgold(self.memory)  # Use FG
+        else:
+            wv = foolsgold(grads)  # Use FG
+        print(wv)
+        
+        self.wv_history.append(wv)
+
+        agg_grads = []
+        # Iterate through each layer
+        for i in range(len(client_grads[0])):
+            temp = wv[0] * client_grads[0][i].cpu().clone()
+            # Aggregate gradients for a layer
+            for c, client_grad in enumerate(client_grads):
+                if c == 0:
+                    continue
+                temp += wv[c] * client_grad[i].cpu()
+            temp = temp / len(client_grads)
+            agg_grads.append(temp)
+        print('model aggregation took {}s'.format(time.time() - cur_time))
+        return agg_grads
+
+
+# simple median estimator
+def simple_median(w):
+    device = w[0][list(w[0].keys())[0]].device
+    w_med = copy.deepcopy(w[0])
+    cur_time = time.time()
+    for k in w_med.keys():
+        shape = w_med[k].shape
+        if len(shape) == 0:
+            continue
+        total_num = reduce(lambda x, y: x * y, shape)
+        y_list = torch.FloatTensor(len(w), total_num).to(device)
+        for i in range(len(w)):
+            y_list[i] = torch.reshape(w[i][k], (-1,))
+        y = torch.t(y_list)
+        median_result = median_opt(y)
+        assert total_num == len(median_result)
+
+        weight = torch.reshape(median_result, shape)
+        w_med[k] = weight
+    print('model aggregation "median" took {}s'.format(time.time() - cur_time))
+    return w_med
+
+
+def trimmed_mean(w, trim_ratio):
+    assert trim_ratio < 0.5, 'trim ratio is {}, but it should be less than 0.5'.format(trim_ratio)
+    trim_num = int(trim_ratio * len(w))
+    device = w[0][list(w[0].keys())[0]].device
+    w_med = copy.deepcopy(w[0])
+    cur_time = time.time()
+    for k in w_med.keys():
+        shape = w_med[k].shape
+        if len(shape) == 0:
+            continue
+        total_num = reduce(lambda x, y: x * y, shape)
+        y_list = torch.FloatTensor(len(w), total_num).to(device)
+        for i in range(len(w)):
+            y_list[i] = torch.reshape(w[i][k], (-1,))
+        y = torch.t(y_list)
+        y_sorted = y.sort()[0]
+        result = y_sorted[:, trim_num:-trim_num]
+        result = result.mean(dim=-1)
+        assert total_num == len(result)
+
+        weight = torch.reshape(result, shape)
+        w_med[k] = weight
+    print('model aggregation "trimmed mean" took {}s'.format(time.time() - cur_time))
+    return w_med
+
+
+def fltrust(w):
+    """
+    weight: list of weights. The first one is the server update.
+    """
+    num_clients = len(w)-1
+    
+    # use the last gradient (server update) as the trusted source
+    baseline = []
+    for j in list(w[0].values()):
+        baseline = np.append(baseline, np.array(j.tolist()).flatten())
+
+    grad_len = len(baseline)
+    grads = np.zeros((num_clients, grad_len))
+    weight = []
+    
+    # compute cos similarity
+    for i in range(0, num_clients):
+        layer = []
+        for j in list(w[i+1].values()):
+            layer = np.append(layer, np.array(j.tolist()).flatten())
+            
+        # grads[i] contains all the grads of client[i]
+        grads[i] = layer
+        weight.append(smp.cosine_similarity(grads[i].reshape(1,-1), baseline.reshape(1,-1)).flatten().tolist()[-1])
+
+    # relu
+    weight = np.maximum(weight,0)
+    
+    # weighted trust score
+    normalized_weights = weight / (np.sum(weight) + 1e-9)
+    print(normalized_weights)
+    
+    # normalize the magnitudes and weight by the trust score
+    w_avg = copy.deepcopy(w[0])
+    # k: layer in NN
+    for k in w_avg.keys():
+        w_norm = np.linalg.norm(w[1][k].cpu().numpy() + 1e-9) / np.linalg.norm(w[0][k].cpu().numpy() + 1e-9)
+        w_avg[k] = torch.mul(w[1][k] , normalized_weights[1] / w_norm )
+        # len(w): num_clients
+        for i in range(2, len(w)-1):
+            w_norm = np.linalg.norm(w[i][k].cpu().numpy() + 1e-9) / np.linalg.norm(w[0][k].cpu().numpy() + 1e-9)
+            w_avg[k] += torch.mul(w[i][k], normalized_weights[i]/w_norm)
+    
+    return w_avg
+
+def gaussian_zero_mean(x, sig=1):
+    return torch.exp(- x * x / (2 * sig * sig))
+
+
+if __name__ == "__main__":
+    # from matplotlib import pyplot as mp
+    #
+    # x_values = np.linspace(-3, 3, 120)
+    # for mu, sig in [(0, 1)]:
+    #     mp.plot(x_values, gaussian(x_values, mu, sig))
+    #
+    # mp.show()
+
     torch.manual_seed(0)
     y = torch.ones(1, 10).cuda()
     e = gaussian_reweight_algorithm_restricted(y, 2, thresh=0.1)
